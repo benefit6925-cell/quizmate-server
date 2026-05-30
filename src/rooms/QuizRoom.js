@@ -55,6 +55,11 @@ class QuizRoom extends Room {
     this._tokenToSessionId  = {};   // token  → current sessionId
     this._sessionIdToToken  = {};   // sessionId → token  (reverse, for cleanup)
 
+    // Cached count of active (non-host, non-exited) players.
+    // Maintained incrementally so _checkAllFinished and blitzAnswer
+    // never need an O(n) full-scan of the players map per message.
+    this._activePlayerCount = 0;
+
     // Timer handles
     this._phaseTimer        = null;
     this._tickInterval      = null;
@@ -219,6 +224,7 @@ class QuizRoom extends Room {
 
       this.state.players.set(client.sessionId, player);
       assignedToken = this._generateToken();
+      this._activePlayerCount++; // new non-host player joining
     }
 
     // Register token maps for this session
@@ -288,6 +294,7 @@ class QuizRoom extends Room {
     const inActiveGame = !['lobby', 'waiting_next_round', 'results', 'closed'].includes(this.state.phase);
     if (consented && !inActiveGame) {
       player.exited = true;
+      this._activePlayerCount = Math.max(0, this._activePlayerCount - 1);
       // Consented lobby-leave: clean up their token so the nickname is freed
       const tok = this._sessionIdToToken[client.sessionId];
       if (tok) {
@@ -354,6 +361,7 @@ class QuizRoom extends Room {
       this.state.teamScoreB    = 0;
       this.state.inSuddenDeath = false;
       this.state.roundNumber++;
+      this._suddenDeathRound   = 0; // reset for this game
 
       // Re-balance blitz teams
       if (this.state.settings.gameMode === 'blitz') {
@@ -402,6 +410,7 @@ class QuizRoom extends Room {
       });
 
       // Kick off phase machine
+      this._recalcActiveCount(); // sync active count before gameplay begins
       this._startCountdown();
     });
 
@@ -438,8 +447,13 @@ class QuizRoom extends Room {
     this.onMessage('submitAnswer', (client, data) => {
       const player = this.state.players.get(client.sessionId);
       if (!player || player.isHost || player.eliminated || player.finished) return;
+      if (this.state.phase !== 'question') return; // only accept during question phase
 
       const qi = data.questionIndex;
+
+      // Reject answers for questions other than the current one.
+      // Prevents a delayed network message from scoring a future or past question.
+      if (qi !== this.state.questionIndex) return;
 
       // ── Duplicate submission guard ──
       // answeredIndex is stored in schema so reconnecting clients
@@ -505,7 +519,10 @@ class QuizRoom extends Room {
     // ── PLAYER: Exit lobby ──
     this.onMessage('playerExit', (client) => {
       const player = this.state.players.get(client.sessionId);
-      if (player) player.exited = true;
+      if (player && !player.exited) {
+        player.exited = true;
+        this._activePlayerCount = Math.max(0, this._activePlayerCount - 1);
+      }
     });
 
     // ── BLITZ: Answer submission ──
@@ -513,8 +530,13 @@ class QuizRoom extends Room {
     this.onMessage('blitzAnswer', (client, data) => {
       const player = this.state.players.get(client.sessionId);
       if (!player || player.isHost) return;
+      if (this.state.phase !== 'question') return; // only accept answers during question phase
 
       const qi = data.questionIndex;
+
+      // Validate qi matches the server's current question — reject stale answers.
+      // This prevents a late message from recreating blitzRound after revealSent=true.
+      if (qi !== this.state.questionIndex) return;
 
       if (!this.blitzRound || this.blitzRound.questionIndex !== qi) {
         this.blitzRound = {
@@ -526,6 +548,9 @@ class QuizRoom extends Room {
         this._scheduleBlitzRevealTimeout(qi);
       }
 
+      // Reject if reveal already sent for this round
+      if (this.blitzRound.revealSent) return;
+
       // One answer per player per question
       if (this.blitzRound.answers[client.sessionId]) return;
 
@@ -536,13 +561,10 @@ class QuizRoom extends Room {
         timestamp: Date.now(),           // server clock — never trust data.timestamp
       };
 
-      // Check if all active players have answered
-      const active  = [...this.state.players.values()].filter(
-        p => !p.isHost && !p.exited && !p.finished
-      );
+      // Check if all active players have answered.
+      // Uses _activePlayerCount (O(1)) instead of scanning the full players map.
       const answered = Object.keys(this.blitzRound.answers).length;
-
-      if (answered >= active.length && active.length > 0 && !this.blitzRound.revealSent) {
+      if (answered >= this._activePlayerCount && this._activePlayerCount > 0 && !this.blitzRound.revealSent) {
         this._sendBlitzReveal(qi);
       }
     });
@@ -656,6 +678,12 @@ class QuizRoom extends Room {
   }
 
   _startQuestion(index) {
+    // Guard against stale timer callbacks firing after _endGame or _resetRoom.
+    // e.g. the countdown interval fires its last tick at the exact moment
+    // the host presses endGame — without this, a question would start on top of results.
+    const terminalPhases = ['results', 'waiting_next_round', 'lobby', 'closed'];
+    if (terminalPhases.includes(this.state.phase)) return;
+
     const mode = this.state.settings.gameMode;
 
     if (index >= this.activeQuestions.length) {
@@ -792,6 +820,7 @@ class QuizRoom extends Room {
     this.activeQuestions = [];
     this.blitzRound      = null;
     this._globalEndTime  = null;
+    this._suddenDeathRound = 0; // reset sudden-death counter for next round
 
     if (newSettings) this._applySettings(newSettings);
 
@@ -914,6 +943,7 @@ class QuizRoom extends Room {
       this.state.inSuddenDeath = true;
       this._suddenDeathRound = (this._suddenDeathRound || 0) + 1;
 
+      this._clearPhaseTimer(); // always clear before scheduling a new one
       if (this._suddenDeathRound > MAX_SUDDEN_DEATH) {
         // Too many ties — end as a draw after the reveal delay
         this._phaseTimer = setTimeout(() => this._endGame(), (REVEAL_DURATION + 0.5) * 1000);
@@ -943,6 +973,7 @@ class QuizRoom extends Room {
 
     } else if (isLastQuestion) {
       // Last question revealed, no tie — end the game
+      this._clearPhaseTimer(); // clear before scheduling
       this._phaseTimer = setTimeout(() => this._endGame(), (REVEAL_DURATION + 0.5) * 1000);
     }
   }
@@ -978,12 +1009,30 @@ class QuizRoom extends Room {
     this.state.blitzTeamCountB = b;
   }
 
+  // Recalculate _activePlayerCount from ground truth.
+  // Called at game start so any lobby-phase drift (exits, late joins) is corrected
+  // before the counter is used for _checkAllFinished comparisons.
+  _recalcActiveCount() {
+    let count = 0;
+    this.state.players.forEach((p) => {
+      if (!p.isHost && !p.exited) count++;
+    });
+    this._activePlayerCount = count;
+  }
+
+  // Called after every elimination or finish event.
+  // Uses _activePlayerCount (maintained incrementally) and a simple finished/eliminated
+  // counter so we never spread the entire players map on every answer submission.
   _checkAllFinished() {
     if (this.state.phase === 'results' || this.state.phase === 'waiting_next_round') return;
-    const active = [...this.state.players.values()].filter(
-      p => !p.isHost && !p.exited
-    );
-    if (active.length > 0 && active.every(p => p.finished || p.eliminated)) {
+    if (this._activePlayerCount <= 0) return;
+
+    let doneCount = 0;
+    this.state.players.forEach((p) => {
+      if (!p.isHost && !p.exited && (p.finished || p.eliminated)) doneCount++;
+    });
+
+    if (doneCount >= this._activePlayerCount) {
       this.broadcast('allFinished', {});
       this._endGame();
     }
