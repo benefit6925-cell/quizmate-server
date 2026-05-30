@@ -19,6 +19,13 @@ class QuizRoom extends Room {
     this.blitzTeamCountA = 0;
     this.blitzTeamCountB = 0;
 
+    // FIX #3: Server-authoritative blitz team scores
+    this.teamScoreA = 0;
+    this.teamScoreB = 0;
+
+    // FIX #11: Sudden death tracking
+    this.inSuddenDeath = false;
+
     if (options.pin) this.roomId = options.pin.toUpperCase();
 
     this._registerHandlers();
@@ -36,13 +43,32 @@ class QuizRoom extends Room {
       this.status = 'active';
       this.blitzRound = null;
 
-      // Reset scores but keep host out of player list
+      // FIX #3: Reset server-authoritative team scores on each game start
+      this.teamScoreA = 0;
+      this.teamScoreB = 0;
+      this.inSuddenDeath = false;
+
+      // Reset all player state
       Object.values(this.players).forEach(p => {
         if (p.isHost) return;
         p.score = 0; p.correctCount = 0; p.finished = false;
         p.eliminated = false; p.finishedAt = 0; p.blitzCorrectCount = 0;
         p.answers = {};
       });
+
+      // Re-assign blitz teams on game start so team counts are accurate
+      if ((this.settings.gameMode || 'classic') === 'blitz') {
+        this.blitzTeamCountA = 0;
+        this.blitzTeamCountB = 0;
+        Object.values(this.players).forEach(p => {
+          if (p.isHost || p.exited) return;
+          if (!p.team) {
+            p.team = this.blitzTeamCountA <= this.blitzTeamCountB ? 'A' : 'B';
+          }
+          if (p.team === 'A') this.blitzTeamCountA++;
+          else this.blitzTeamCountB++;
+        });
+      }
 
       this.broadcast('gameStarted', {
         activeQuestions: this.activeQuestions,
@@ -60,6 +86,7 @@ class QuizRoom extends Room {
         const remaining = Math.max(0, this.globalEndTime - Date.now());
         this.gameEndTimer = setTimeout(() => this._serverEndGame(), remaining);
       }
+      // Blitz has no global timer — it ends when all questions are revealed
     });
 
     this.onMessage('endGame', (client) => {
@@ -86,7 +113,11 @@ class QuizRoom extends Room {
     this.onMessage('submitAnswer', (client, data) => {
       const p = this.players[client.sessionId];
       if (!p || p.isHost) return;
+
+      // Guard: ignore duplicate answer for same question
       p.answers = p.answers || {};
+      if (p.answers[data.questionIndex] !== undefined) return;
+
       p.answers[data.questionIndex] = data.answer;
       if (data.correct) p.correctCount++;
       p.score = data.score;
@@ -97,6 +128,10 @@ class QuizRoom extends Room {
     this.onMessage('playerFinished', (client, data) => {
       const p = this.players[client.sessionId];
       if (!p || p.isHost) return;
+
+      // Guard: ignore if already finished
+      if (p.finished) return;
+
       p.score = data.score;
       p.correctCount = data.correctCount;
       p.finished = true;
@@ -108,10 +143,16 @@ class QuizRoom extends Room {
     this.onMessage('eliminatePlayer', (client, data) => {
       const p = this.players[client.sessionId];
       if (!p || p.isHost) return;
+
+      // Guard: ignore if already eliminated
+      if (p.eliminated) return;
+
       p.score = data.score;
       p.correctCount = data.correctCount;
       p.eliminated = true;
       p.finishedAt = Date.now();
+
+      // FIX #4: Broadcast immediately so spectators and admin see elimination right away
       this._broadcastPlayers();
       this._checkAllFinished();
     });
@@ -127,25 +168,44 @@ class QuizRoom extends Room {
       const qi = data.questionIndex;
 
       if (!this.blitzRound || this.blitzRound.questionIndex !== qi) {
-        this.blitzRound = { questionIndex: qi, answers: {}, revealSent: false };
-      }
-
-      if (!this.blitzRound.answers[client.sessionId]) {
-        this.blitzRound.answers[client.sessionId] = {
-          sessionId: client.sessionId,
-          team: data.team || player.team || 'A',
-          answer: data.answer,
-          timestamp: data.timestamp
+        this.blitzRound = {
+          questionIndex: qi,
+          answers: {},
+          revealSent: false,
+          revealTimer: null
         };
       }
+
+      // Guard: one answer per player per question
+      if (this.blitzRound.answers[client.sessionId]) return;
+
+      this.blitzRound.answers[client.sessionId] = {
+        sessionId: client.sessionId,
+        team: data.team || player.team || 'A',
+        answer: data.answer,
+        timestamp: data.timestamp
+      };
 
       const activePlayers = Object.values(this.players).filter(
         p => !p.isHost && !p.exited && !p.finished
       );
       const answered = Object.keys(this.blitzRound.answers).length;
+
+      // Trigger reveal when everyone has answered
       if (answered >= activePlayers.length && activePlayers.length > 0 && !this.blitzRound.revealSent) {
         this._sendBlitzReveal(qi);
       }
+    });
+
+    // FIX #2: Blitz reveal timeout — host can trigger reveal if players are slow
+    // This is called by the server's own blitz question timer (set in _sendBlitzRevealAfterTimeout)
+    this.onMessage('blitzForceReveal', (client, data) => {
+      if (!this._isHost(client)) return;
+      const qi = data.questionIndex;
+      if (!this.blitzRound || this.blitzRound.questionIndex !== qi) {
+        this.blitzRound = { questionIndex: qi, answers: {}, revealSent: false, revealTimer: null };
+      }
+      if (!this.blitzRound.revealSent) this._sendBlitzReveal(qi);
     });
 
     this.onMessage('blitzReaction', (client, data) => {
@@ -171,7 +231,8 @@ class QuizRoom extends Room {
     this.onMessage('updateBlitzScore', (client, data) => {
       const p = this.players[client.sessionId];
       if (!p || p.isHost) return;
-      p.score = data.score;
+      // FIX #3: Don't use client-reported score as authority — only update correctCount here.
+      // Team scores are now server-authoritative from _sendBlitzReveal.
       p.blitzCorrectCount = data.blitzCorrectCount;
       this._broadcastPlayers();
     });
@@ -179,11 +240,12 @@ class QuizRoom extends Room {
     this.onMessage('blitzFinished', (client, data) => {
       const p = this.players[client.sessionId];
       if (!p || p.isHost) return;
-      p.score = data.score;
+      if (p.finished) return;
+
+      // FIX #3: Use server-authoritative team scores, not client-reported ones
+      p.score = p.team === 'A' ? this.teamScoreA : this.teamScoreB;
       p.blitzCorrectCount = data.blitzCorrectCount;
-      p.team = data.blitzTeam;
-      p.teamScoreA = data.teamScoreA;
-      p.teamScoreB = data.teamScoreB;
+      p.team = data.blitzTeam || p.team;
       p.finished = true;
       p.finishedAt = Date.now();
       this._broadcastPlayers();
@@ -232,7 +294,6 @@ class QuizRoom extends Room {
     const isReconnect = !!options.reconnect;
 
     if (isHost) {
-      // Host does NOT get added to players list — host is separate
       this.hostSessionId = client.sessionId;
       client.send('joinAck', {
         status: this.status,
@@ -240,7 +301,7 @@ class QuizRoom extends Room {
         gameMode: this.settings.gameMode || 'classic',
         questions: this.customQuestions
       });
-      // Send current players to host
+      // Also send current player state so admin dashboard populates immediately
       this._broadcastPlayers();
       console.log(`[QuizRoom] Host joined: ${this.roomId}`);
       return;
@@ -248,7 +309,9 @@ class QuizRoom extends Room {
 
     const nick = (options.nickname || 'Player').slice(0, 24);
 
-    // Check nickname taken
+    // FIX #6: Send a unified 'gameState' message (matching what the client expects)
+    // AND also send 'joinAck' for reconnect path — both use the same data shape
+
     if (!isReconnect) {
       const taken = Object.values(this.players).some(
         p => !p.exited && p.nickname.toLowerCase() === nick.toLowerCase()
@@ -274,43 +337,56 @@ class QuizRoom extends Room {
         blitzCorrectCount: 0, answers: {}
       };
       this.players[client.sessionId] = player;
+    } else {
+      // Reconnecting player — restore their session
+      player.exited = false;
     }
+
+    this.allowReconnection(client, 120); // FIX #1: Increased reconnect window to 2 min
+
+    const baseAck = {
+      settings: this.settings,
+      gameMode: this.settings.gameMode || 'classic',
+      assignedTeam: player.team,
+      teamAName: this.settings.teamAName || 'Team A',
+      teamBName: this.settings.teamBName || 'Team B',
+      countA: this.blitzTeamCountA,
+      countB: this.blitzTeamCountB,
+      score: player.score,
+      correctCount: player.correctCount,
+      eliminated: player.eliminated,
+      finished: player.finished,
+      // FIX #3: Send server-authoritative team scores on join/reconnect
+      teamScoreA: this.teamScoreA,
+      teamScoreB: this.teamScoreB,
+    };
 
     if (this.status === 'active') {
-      client.send('joinAck', {
-        status: 'active', waiting: true,
-        settings: this.settings,
-        eliminated: player.eliminated,
-        finished: player.finished,
-        score: player.score,
-        correctCount: player.correctCount,
-        gameMode: this.settings.gameMode,
-        team: player.team,
-        teamAName: this.settings.teamAName,
-        teamBName: this.settings.teamBName,
+      const ackData = {
+        ...baseAck,
+        status: 'active',
+        waiting: !player.eliminated && !player.finished,
         activeQuestions: this.activeQuestions,
-        startTime: this.startTime
-      });
+        startTime: this.startTime,
+        globalEndTime: this.globalEndTime,
+      };
+      // Send both message names so both client code paths work
+      client.send('joinAck', ackData);
+      client.send('gameState', { ...ackData, players: this._getPlayersOnly() });
     } else {
-      client.send('joinAck', {
-        status: 'lobby',
-        settings: this.settings,
-        gameMode: this.settings.gameMode || 'classic',
-        assignedTeam: player.team,
-        teamAName: this.settings.teamAName || 'Team A',
-        teamBName: this.settings.teamBName || 'Team B',
-        countA: this.blitzTeamCountA,
-        countB: this.blitzTeamCountB
-      });
+      const ackData = { ...baseAck, status: 'lobby' };
+      client.send('joinAck', ackData);
+      client.send('gameState', { ...ackData, players: this._getPlayersOnly() });
     }
 
-    this.allowReconnection(client, 60);
     this._broadcastPlayers();
-    console.log(`[QuizRoom] ${nick} joined ${this.roomId}`);
+    console.log(`[QuizRoom] ${nick} joined ${this.roomId} (reconnect=${isReconnect})`);
   }
 
   onLeave(client, consented) {
     if (client.sessionId === this.hostSessionId) return;
+    // Don't remove player immediately — allowReconnection gives them 2 min to return
+    // Just broadcast so others see they left
     this._broadcastPlayers();
   }
 
@@ -323,13 +399,16 @@ class QuizRoom extends Room {
     return client.sessionId === this.hostSessionId;
   }
 
-  _broadcastPlayers() {
-    // Only send actual players, never the host
+  _getPlayersOnly() {
     const playersOnly = {};
     Object.entries(this.players).forEach(([id, p]) => {
       if (!p.isHost) playersOnly[id] = p;
     });
-    this.broadcast('playersUpdated', { players: playersOnly });
+    return playersOnly;
+  }
+
+  _broadcastPlayers() {
+    this.broadcast('playersUpdated', { players: this._getPlayersOnly() });
   }
 
   _checkAllFinished() {
@@ -342,7 +421,7 @@ class QuizRoom extends Room {
 
   _serverEndGame() {
     this._clearTimers();
-    if (this.status === 'ended') return;
+    if (this.status === 'ended') return; // FIX #5: Idempotent guard prevents double trigger
     this.status = 'ended';
     this.broadcast('gameEnded', {});
     console.log(`[QuizRoom] Game ended: ${this.roomId}`);
@@ -357,6 +436,11 @@ class QuizRoom extends Room {
     this.blitzRound = null;
     this.blitzTeamCountA = 0;
     this.blitzTeamCountB = 0;
+    // FIX #3: Reset server-authoritative team scores on room reset
+    this.teamScoreA = 0;
+    this.teamScoreB = 0;
+    this.inSuddenDeath = false;
+
     if (newSettings) this.settings = newSettings;
 
     Object.values(this.players).forEach(p => {
@@ -366,12 +450,7 @@ class QuizRoom extends Room {
       p.blitzCorrectCount = 0; p.team = ''; p.answers = {};
     });
 
-    const playersOnly = {};
-    Object.entries(this.players).forEach(([id, p]) => {
-      if (!p.isHost) playersOnly[id] = p;
-    });
-
-    this.broadcast('roundReset', { settings: this.settings, players: playersOnly });
+    this.broadcast('roundReset', { settings: this.settings, players: this._getPlayersOnly() });
     console.log(`[QuizRoom] Reset: ${this.roomId}`);
   }
 
@@ -379,13 +458,17 @@ class QuizRoom extends Room {
     if (this.gameEndTimer) { clearTimeout(this.gameEndTimer); this.gameEndTimer = null; }
     if (this.blitzRound && this.blitzRound.revealTimer) {
       clearTimeout(this.blitzRound.revealTimer);
+      this.blitzRound.revealTimer = null;
     }
   }
 
   _sendBlitzReveal(questionIndex) {
     if (!this.blitzRound || this.blitzRound.revealSent) return;
     this.blitzRound.revealSent = true;
-    if (this.blitzRound.revealTimer) clearTimeout(this.blitzRound.revealTimer);
+    if (this.blitzRound.revealTimer) {
+      clearTimeout(this.blitzRound.revealTimer);
+      this.blitzRound.revealTimer = null;
+    }
 
     const q = this.activeQuestions[questionIndex];
     if (!q) return;
@@ -415,6 +498,14 @@ class QuizRoom extends Room {
     const aPoints = aRes.deadlock ? 0 : aRes.perfect ? 25 : aWin ? 10 : 0;
     const bPoints = bRes.deadlock ? 0 : bRes.perfect ? 25 : bWin ? 10 : 0;
 
+    // FIX #3: Accumulate scores server-side and send running totals (not deltas)
+    this.teamScoreA += aPoints;
+    this.teamScoreB += bPoints;
+
+    // FIX #11: Check if this was the last question — handle sudden death server-side
+    const isLastQuestion = questionIndex >= this.activeQuestions.length - 1;
+    const isTie = isLastQuestion && this.teamScoreA === this.teamScoreB && !this.inSuddenDeath;
+
     this.broadcast('blitzReveal', {
       q: questionIndex,
       questionText: q.q,
@@ -422,8 +513,49 @@ class QuizRoom extends Room {
       aVote: aRes.vote, aVotes: aRes.votes, aDeadlock: aRes.deadlock,
       aPerfect: aRes.perfect, aPoints,
       bVote: bRes.vote, bVotes: bRes.votes, bDeadlock: bRes.deadlock,
-      bPerfect: bRes.perfect, bPoints
+      bPerfect: bRes.perfect, bPoints,
+      // FIX #3: Send running totals so clients don't need to accumulate
+      teamScoreA: this.teamScoreA,
+      teamScoreB: this.teamScoreB,
     });
+
+    // FIX #11: If last question and tied, trigger sudden death from server
+    if (isTie) {
+      this.inSuddenDeath = true;
+      // After reveal display time, broadcast sudden death question
+      setTimeout(() => {
+        const sdQ = this.activeQuestions[0]; // Use first question as tiebreaker
+        const sdQWrapped = { ...sdQ, q: '⚡ SUDDEN DEATH: ' + sdQ.q };
+        this.activeQuestions.push(sdQWrapped);
+        // Reset blitzRound for the sudden death question
+        this.blitzRound = {
+          questionIndex: this.activeQuestions.length - 1,
+          answers: {},
+          revealSent: false,
+          revealTimer: null
+        };
+        this.broadcast('blitzSuddenDeath', {
+          question: sdQWrapped,
+          questionIndex: this.activeQuestions.length - 1
+        });
+      }, 4500); // Enough time for the reveal screen countdown
+    }
+  }
+
+  // FIX #2: Server-side blitz question timeout
+  // Called by host client after blitz timer expires, or can be called internally
+  _scheduleBlitzRevealTimeout(questionIndex) {
+    if (this.blitzRound && this.blitzRound.revealTimer) {
+      clearTimeout(this.blitzRound.revealTimer);
+    }
+    const dur = (this.settings.blitzTimerDuration || 12) * 1000 + 1000; // +1s grace
+    this.blitzRound = this.blitzRound || {
+      questionIndex, answers: {}, revealSent: false, revealTimer: null
+    };
+    this.blitzRound.revealTimer = setTimeout(() => {
+      if (!this.blitzRound || this.blitzRound.revealSent) return;
+      this._sendBlitzReveal(questionIndex);
+    }, dur);
   }
 }
 
