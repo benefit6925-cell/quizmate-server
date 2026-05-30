@@ -15,13 +15,10 @@ class QuizRoom extends Room {
     this.settings = options.settings || {};
     this.players = {};
     this.gameEndTimer = null;
-
-    // Blitz state
-    this.blitzRound = null; // { questionIndex, answers: {}, revealSent, revealTimer }
+    this.blitzRound = null;
     this.blitzTeamCountA = 0;
     this.blitzTeamCountB = 0;
 
-    // Use PIN as room ID so client.joinById(pin) works
     if (options.pin) this.roomId = options.pin.toUpperCase();
 
     this._registerHandlers();
@@ -30,7 +27,6 @@ class QuizRoom extends Room {
 
   _registerHandlers() {
 
-    // ── HOST: startGame ──────────────────────────────────────────────────────
     this.onMessage('startGame', (client, data) => {
       if (!this._isHost(client)) return;
       this.settings = data.settings || this.settings;
@@ -40,8 +36,9 @@ class QuizRoom extends Room {
       this.status = 'active';
       this.blitzRound = null;
 
-      // Reset scores for fresh game
+      // Reset scores but keep host out of player list
       Object.values(this.players).forEach(p => {
+        if (p.isHost) return;
         p.score = 0; p.correctCount = 0; p.finished = false;
         p.eliminated = false; p.finishedAt = 0; p.blitzCorrectCount = 0;
         p.answers = {};
@@ -54,7 +51,6 @@ class QuizRoom extends Room {
         settings: this.settings
       });
 
-      // Auto-end timer
       this._clearTimers();
       const mode = this.settings.gameMode || 'classic';
       if (mode === 'classic' || mode === 'survival') {
@@ -66,35 +62,30 @@ class QuizRoom extends Room {
       }
     });
 
-    // ── HOST: endGame ────────────────────────────────────────────────────────
     this.onMessage('endGame', (client) => {
       if (!this._isHost(client)) return;
       this._serverEndGame();
     });
 
-    // ── HOST: resetGame ──────────────────────────────────────────────────────
     this.onMessage('resetGame', (client) => {
       if (!this._isHost(client)) return;
       this._resetRoom(this.settings);
     });
 
-    // ── HOST: nextRound ──────────────────────────────────────────────────────
     this.onMessage('nextRound', (client, data) => {
       if (!this._isHost(client)) return;
       this._resetRoom(data.settings || this.settings);
     });
 
-    // ── HOST: updateSettings ─────────────────────────────────────────────────
     this.onMessage('updateSettings', (client, data) => {
       if (!this._isHost(client)) return;
       this.settings = data.settings || this.settings;
       this.broadcast('settingsUpdated', { settings: this.settings });
     });
 
-    // ── PLAYER: submitAnswer ─────────────────────────────────────────────────
     this.onMessage('submitAnswer', (client, data) => {
       const p = this.players[client.sessionId];
-      if (!p) return;
+      if (!p || p.isHost) return;
       p.answers = p.answers || {};
       p.answers[data.questionIndex] = data.answer;
       if (data.correct) p.correctCount++;
@@ -103,10 +94,9 @@ class QuizRoom extends Room {
       this._broadcastPlayers();
     });
 
-    // ── PLAYER: playerFinished ───────────────────────────────────────────────
     this.onMessage('playerFinished', (client, data) => {
       const p = this.players[client.sessionId];
-      if (!p) return;
+      if (!p || p.isHost) return;
       p.score = data.score;
       p.correctCount = data.correctCount;
       p.finished = true;
@@ -115,10 +105,9 @@ class QuizRoom extends Room {
       this._checkAllFinished();
     });
 
-    // ── PLAYER: eliminatePlayer ──────────────────────────────────────────────
     this.onMessage('eliminatePlayer', (client, data) => {
       const p = this.players[client.sessionId];
-      if (!p) return;
+      if (!p || p.isHost) return;
       p.score = data.score;
       p.correctCount = data.correctCount;
       p.eliminated = true;
@@ -127,23 +116,20 @@ class QuizRoom extends Room {
       this._checkAllFinished();
     });
 
-    // ── PLAYER: playerExit ───────────────────────────────────────────────────
     this.onMessage('playerExit', (client) => {
       const p = this.players[client.sessionId];
       if (p) { p.exited = true; this._broadcastPlayers(); }
     });
 
-    // ── BLITZ: blitzAnswer ───────────────────────────────────────────────────
     this.onMessage('blitzAnswer', (client, data) => {
       const player = this.players[client.sessionId];
-      if (!player) return;
+      if (!player || player.isHost) return;
       const qi = data.questionIndex;
 
       if (!this.blitzRound || this.blitzRound.questionIndex !== qi) {
         this.blitzRound = { questionIndex: qi, answers: {}, revealSent: false };
       }
 
-      // First answer only
       if (!this.blitzRound.answers[client.sessionId]) {
         this.blitzRound.answers[client.sessionId] = {
           sessionId: client.sessionId,
@@ -153,7 +139,6 @@ class QuizRoom extends Room {
         };
       }
 
-      // Check if everyone answered
       const activePlayers = Object.values(this.players).filter(
         p => !p.isHost && !p.exited && !p.finished
       );
@@ -163,7 +148,6 @@ class QuizRoom extends Room {
       }
     });
 
-    // ── BLITZ: blitzReaction ─────────────────────────────────────────────────
     this.onMessage('blitzReaction', (client, data) => {
       this.clients.forEach(c => {
         if (c.sessionId === client.sessionId) return;
@@ -174,7 +158,6 @@ class QuizRoom extends Room {
       });
     });
 
-    // ── BLITZ: blitzSignal ───────────────────────────────────────────────────
     this.onMessage('blitzSignal', (client, data) => {
       this.clients.forEach(c => {
         if (c.sessionId === client.sessionId) return;
@@ -185,19 +168,17 @@ class QuizRoom extends Room {
       });
     });
 
-    // ── BLITZ: updateBlitzScore ──────────────────────────────────────────────
     this.onMessage('updateBlitzScore', (client, data) => {
       const p = this.players[client.sessionId];
-      if (!p) return;
+      if (!p || p.isHost) return;
       p.score = data.score;
       p.blitzCorrectCount = data.blitzCorrectCount;
       this._broadcastPlayers();
     });
 
-    // ── BLITZ: blitzFinished ─────────────────────────────────────────────────
     this.onMessage('blitzFinished', (client, data) => {
       const p = this.players[client.sessionId];
-      if (!p) return;
+      if (!p || p.isHost) return;
       p.score = data.score;
       p.blitzCorrectCount = data.blitzCorrectCount;
       p.team = data.blitzTeam;
@@ -208,14 +189,12 @@ class QuizRoom extends Room {
       this._broadcastPlayers();
     });
 
-    // ── QUESTIONS: addQuestion ────────────────────────────────────────────────
     this.onMessage('addQuestion', (client, data) => {
       if (!this._isHost(client)) return;
       this.customQuestions.push(data.question);
       this.broadcast('questionsUpdated', { questions: this.customQuestions });
     });
 
-    // ── QUESTIONS: updateQuestion ─────────────────────────────────────────────
     this.onMessage('updateQuestion', (client, data) => {
       if (!this._isHost(client)) return;
       const idx = this.customQuestions.findIndex(q => q.id === data.question.id);
@@ -223,21 +202,18 @@ class QuizRoom extends Room {
       this.broadcast('questionsUpdated', { questions: this.customQuestions });
     });
 
-    // ── QUESTIONS: deleteQuestion ─────────────────────────────────────────────
     this.onMessage('deleteQuestion', (client, data) => {
       if (!this._isHost(client)) return;
       this.customQuestions = this.customQuestions.filter(q => q.id !== data.id);
       this.broadcast('questionsUpdated', { questions: this.customQuestions });
     });
 
-    // ── QUESTIONS: clearQuestions ─────────────────────────────────────────────
     this.onMessage('clearQuestions', (client) => {
       if (!this._isHost(client)) return;
       this.customQuestions = [];
       this.broadcast('questionsUpdated', { questions: [] });
     });
 
-    // ── PLAYER: selectTeam ────────────────────────────────────────────────────
     this.onMessage('selectTeam', (client, data) => {
       const p = this.players[client.sessionId];
       if (!p) return;
@@ -251,34 +227,31 @@ class QuizRoom extends Room {
     });
   }
 
-  // ── onJoin ──────────────────────────────────────────────────────────────────
   onJoin(client, options) {
-    const nick = (options.nickname || 'Player').slice(0, 24);
     const isHost = !!options.isHost;
     const isReconnect = !!options.reconnect;
 
     if (isHost) {
+      // Host does NOT get added to players list — host is separate
       this.hostSessionId = client.sessionId;
-      this.players[client.sessionId] = {
-        id: client.sessionId, nickname: nick, isHost: true,
-        score: 0, correctCount: 0, finished: false, eliminated: false,
-        finishedAt: 0, exited: false, team: '', blitzCorrectCount: 0,
-        answers: {}
-      };
       client.send('joinAck', {
         status: this.status,
         settings: this.settings,
         gameMode: this.settings.gameMode || 'classic',
         questions: this.customQuestions
       });
+      // Send current players to host
       this._broadcastPlayers();
+      console.log(`[QuizRoom] Host joined: ${this.roomId}`);
       return;
     }
 
-    // Check nickname taken (skip for reconnects)
+    const nick = (options.nickname || 'Player').slice(0, 24);
+
+    // Check nickname taken
     if (!isReconnect) {
       const taken = Object.values(this.players).some(
-        p => !p.isHost && !p.exited && p.nickname.toLowerCase() === nick.toLowerCase()
+        p => !p.exited && p.nickname.toLowerCase() === nick.toLowerCase()
       );
       if (taken) {
         client.send('joinError', { message: `❌ Nickname "${nick}" is already taken.` });
@@ -289,7 +262,6 @@ class QuizRoom extends Room {
     // Restore or create player
     let player = this.players[client.sessionId];
     if (!player) {
-      // Auto-assign blitz team
       let team = '';
       if ((this.settings.gameMode || 'classic') === 'blitz') {
         team = this.blitzTeamCountA <= this.blitzTeamCountB ? 'A' : 'B';
@@ -304,7 +276,6 @@ class QuizRoom extends Room {
       this.players[client.sessionId] = player;
     }
 
-    // Send acknowledgment
     if (this.status === 'active') {
       client.send('joinAck', {
         status: 'active', waiting: true,
@@ -339,11 +310,8 @@ class QuizRoom extends Room {
   }
 
   onLeave(client, consented) {
-    const p = this.players[client.sessionId];
-    if (p && !p.isHost) {
-      // Keep player in list for leaderboard — just mark offline
-      this._broadcastPlayers();
-    }
+    if (client.sessionId === this.hostSessionId) return;
+    this._broadcastPlayers();
   }
 
   onDispose() {
@@ -351,14 +319,17 @@ class QuizRoom extends Room {
     console.log(`[QuizRoom] Disposed: ${this.roomId}`);
   }
 
-  // ── Private helpers ─────────────────────────────────────────────────────────
-
   _isHost(client) {
     return client.sessionId === this.hostSessionId;
   }
 
   _broadcastPlayers() {
-    this.broadcast('playersUpdated', { players: this.players });
+    // Only send actual players, never the host
+    const playersOnly = {};
+    Object.entries(this.players).forEach(([id, p]) => {
+      if (!p.isHost) playersOnly[id] = p;
+    });
+    this.broadcast('playersUpdated', { players: playersOnly });
   }
 
   _checkAllFinished() {
@@ -389,12 +360,18 @@ class QuizRoom extends Room {
     if (newSettings) this.settings = newSettings;
 
     Object.values(this.players).forEach(p => {
+      if (p.isHost) return;
       p.score = 0; p.correctCount = 0; p.finished = false;
       p.eliminated = false; p.finishedAt = 0; p.exited = false;
       p.blitzCorrectCount = 0; p.team = ''; p.answers = {};
     });
 
-    this.broadcast('roundReset', { settings: this.settings, players: this.players });
+    const playersOnly = {};
+    Object.entries(this.players).forEach(([id, p]) => {
+      if (!p.isHost) playersOnly[id] = p;
+    });
+
+    this.broadcast('roundReset', { settings: this.settings, players: playersOnly });
     console.log(`[QuizRoom] Reset: ${this.roomId}`);
   }
 
@@ -405,7 +382,6 @@ class QuizRoom extends Room {
     }
   }
 
-  // ── Blitz majority-vote reveal ──────────────────────────────────────────────
   _sendBlitzReveal(questionIndex) {
     if (!this.blitzRound || this.blitzRound.revealSent) return;
     this.blitzRound.revealSent = true;
@@ -448,8 +424,6 @@ class QuizRoom extends Room {
       bVote: bRes.vote, bVotes: bRes.votes, bDeadlock: bRes.deadlock,
       bPerfect: bRes.perfect, bPoints
     });
-
-    console.log(`[QuizRoom] Blitz reveal Q${questionIndex}: A=${aRes.vote}(${aPoints}pts) B=${bRes.vote}(${bPoints}pts)`);
   }
 }
 
