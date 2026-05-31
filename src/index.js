@@ -56,6 +56,8 @@ const httpServer = createServer(app);
 const gameServer = new Server({
   transport: new WebSocketTransport({
     server: httpServer,
+    pingInterval: 8000,   // ping every 8s — keeps mobile/cellular connections alive
+    pingMaxRetries: 3,    // drop after 3 missed pongs (~24s silence = truly dead)
     verifyClient: (info, next) => {
       const origin = info.req.headers.origin || '';
       const ok     = !origin || ALLOWED_ORIGINS.includes(origin);
