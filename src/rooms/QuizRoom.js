@@ -275,45 +275,42 @@ class QuizRoom extends Room {
 
   onLeave(client, consented) {
     // ── Host leaving ──
-    // Don't remove the host PlayerState — they can re-claim via hostToken on refresh.
-    // hostSessionId stays set so _isHost() keeps working until they actually re-join.
-    if (client.sessionId === this.hostSessionId) {
-      // Clear the active sessionId so a re-join attempt can succeed.
-      // The hostToken and PlayerState are preserved for re-claim.
-      // We do NOT null out hostSessionId here so in-flight host-command checks
-      // still reject until the new session claims ownership.
-      return;
-    }
+    // Preserve hostToken + PlayerState for re-claim after refresh.
+    // Do NOT clear hostSessionId — in-flight host-command checks keep rejecting
+    // until the new session explicitly claims ownership in onJoin.
+    if (client.sessionId === this.hostSessionId) return;
 
     const player = this.state.players.get(client.sessionId);
     if (!player) return;
 
-    // During an active game, never mark a player as exited on disconnect —
-    // they may reconnect within RECONNECT_WINDOW and must keep their state.
-    // Only mark exited when they deliberately leave from lobby/waiting phases.
     const inActiveGame = !['lobby', 'waiting_next_round', 'results', 'closed'].includes(this.state.phase);
+
     if (consented && !inActiveGame) {
+      // Deliberate leave from lobby/waiting — free the slot immediately.
       player.exited = true;
       this._activePlayerCount = Math.max(0, this._activePlayerCount - 1);
-      // Consented lobby-leave: clean up their token so the nickname is freed
       const tok = this._sessionIdToToken[client.sessionId];
       if (tok) {
         delete this._tokenToSessionId[tok];
+        delete this._sessionIdToToken[client.sessionId];
       }
+      // Consented lobby leave — safe to drop the reconnect promise.
+      if (this._reconnectPromises) delete this._reconnectPromises[client.sessionId];
+      return;
     }
-    // Always clean up the reverse (sessionId→token) map entry,
-    // but leave _tokenToSessionId intact for mid-game disconnects so
-    // token-rejoin can still find the player's entry on reconnect.
+
+    // ── Mid-game disconnect (or non-consented leave) ──
+    // NEVER mark exited, NEVER touch _tokenToSessionId, NEVER delete the
+    // reconnect promise.  The player keeps their slot and score so they can
+    // resume via token-rejoin within RECONNECT_WINDOW without the game
+    // freezing or _checkAllFinished firing a false "all done".
+    //
+    // _sessionIdToToken is cleaned because the sessionId is now dead; the
+    // token→sessionId mapping stays intact so onJoin can find them.
     const tok = this._sessionIdToToken[client.sessionId];
     if (tok) delete this._sessionIdToToken[client.sessionId];
-
-    // Only delete the reconnect promise on consented lobby/waiting leaves.
-    // During an active game, Colyseus needs the promise to hold the player's
-    // slot open for native socket reconnection (within RECONNECT_WINDOW).
-    // Deleting it mid-game kills the socket-level reconnect path entirely.
-    if (consented && !inActiveGame) {
-      if (this._reconnectPromises) delete this._reconnectPromises[client.sessionId];
-    }
+    // Reconnect promise is intentionally NOT deleted — Colyseus needs it to
+    // hold the slot open.  It will be superseded on token-rejoin in onJoin.
   }
 
   onDispose() {
