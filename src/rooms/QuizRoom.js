@@ -307,8 +307,13 @@ class QuizRoom extends Room {
     const tok = this._sessionIdToToken[client.sessionId];
     if (tok) delete this._sessionIdToToken[client.sessionId];
 
-    // Clean up reconnect promise slot
-    if (this._reconnectPromises) delete this._reconnectPromises[client.sessionId];
+    // Only delete the reconnect promise on consented lobby/waiting leaves.
+    // During an active game, Colyseus needs the promise to hold the player's
+    // slot open for native socket reconnection (within RECONNECT_WINDOW).
+    // Deleting it mid-game kills the socket-level reconnect path entirely.
+    if (consented && !inActiveGame) {
+      if (this._reconnectPromises) delete this._reconnectPromises[client.sessionId];
+    }
   }
 
   onDispose() {
