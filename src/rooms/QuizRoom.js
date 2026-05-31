@@ -481,6 +481,18 @@ class QuizRoom extends Room {
         player.score += points;
       }
 
+      // ── Send answer result back to the submitting player ──
+      // Players receive questions with answers stripped (server security), so the
+      // client cannot locally determine correct/wrong or compute authoritative score.
+      // We send back the correct index + authoritative score for accurate UI feedback.
+      client.send('answerResult', {
+        questionIndex: qi,
+        correctAnswer: q.answer,
+        correct,
+        score:        player.score,
+        correctCount: player.correctCount,
+      });
+
       // ── Survival: wrong answer = elimination ──
       if (mode === 'survival' && !correct) {
         player.eliminated = true;
