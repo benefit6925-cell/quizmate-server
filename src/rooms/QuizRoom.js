@@ -450,10 +450,18 @@ class QuizRoom extends Room {
       if (this.state.phase !== 'question') return; // only accept during question phase
 
       const qi = data.questionIndex;
+      const mode = this.state.settings.gameMode;
 
       // Reject answers for questions other than the current one.
-      // Prevents a delayed network message from scoring a future or past question.
-      if (qi !== this.state.questionIndex) return;
+      // Lightning/blitz: state.questionIndex is authoritative (server drives per-question timer).
+      // Classic/survival: players self-advance, so validate against player's own progress
+      // (state.questionIndex stays at 0 in classic since there is no per-question server timer).
+      if (mode === 'lightning' || mode === 'blitz') {
+        if (qi !== this.state.questionIndex) return;
+      } else {
+        // qi must be exactly the next unanswered question for this player
+        if (qi !== player.answeredIndex + 1) return;
+      }
 
       // ── Duplicate submission guard ──
       // answeredIndex is stored in schema so reconnecting clients
@@ -465,7 +473,6 @@ class QuizRoom extends Room {
       if (!q) return;
 
       const correct  = data.answer === q.answer;
-      const mode     = this.state.settings.gameMode;
       const scoring  = this.state.settings.scoringMode;
       const timeSpent = (Date.now() - this.state.questionStartedAt) / 1000;
 
@@ -546,9 +553,12 @@ class QuizRoom extends Room {
 
       const qi = data.questionIndex;
 
-      // Validate qi matches the server's current question — reject stale answers.
-      // This prevents a late message from recreating blitzRound after revealSent=true.
-      if (qi !== this.state.questionIndex) return;
+      // For blitz, we don't use state.questionIndex as authority — the client drives
+      // question advancement from showBlitzReveal. Instead validate against blitzRound.
+      // Reject only if the blitz round for this qi was already revealed (stale answer).
+      if (this.blitzRound && this.blitzRound.questionIndex === qi && this.blitzRound.revealSent) return;
+      // Also reject if qi is for an already-revealed past question
+      if (this.blitzRound && this.blitzRound.questionIndex > qi) return;
 
       if (!this.blitzRound || this.blitzRound.questionIndex !== qi) {
         this.blitzRound = {
@@ -733,6 +743,7 @@ class QuizRoom extends Room {
     } else if (mode === 'classic') {
       // Classic mode uses a single global countdown timer for the whole game.
       // Only start it on question 0 — subsequent questions share the same running timer.
+      // questionIndex is still updated above so answer validation always matches.
       if (index === 0) {
         this._startGlobalTimer();
       }
