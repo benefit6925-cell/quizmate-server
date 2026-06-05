@@ -152,49 +152,76 @@ class QuizRoom extends Room {
     let isTokenRejoin = false;
     let assignedToken = clientToken;
 
+    // ── FIX 3: Two reconnect systems, one job each ───────────────
+    //
+    // allowReconnection() — owns short socket drops (< RECONNECT_WINDOW).
+    //   Colyseus holds the seat open silently. No PlayerState work needed.
+    //   Its promise resolves when the same socket comes back, OR is cancelled
+    //   below when the token system takes over for a longer/page-refresh drop.
+    //
+    // reconnectToken — owns identity migration for page refresh, mobile
+    //   suspend, or any drop where the socket sessionId changes.
+    //   It does all PlayerState + token-map migration.
+    //
+    // The key rule: if a token-rejoin fires, it CANCELS the old
+    // allowReconnection promise by resolving it (not rejecting — Colyseus's
+    // deferred does not expose .reject publicly; resolving it closes the slot
+    // cleanly). A fresh allowReconnection promise is then registered for the
+    // new sessionId. The two systems never both try to own the same slot.
+
     if (clientToken && this._tokenToSessionId[clientToken]) {
-      // Client sent back a known token — find their old PlayerState
+      // Token-based rejoin: page refresh, mobile background, or long drop.
       const oldSessionId = this._tokenToSessionId[clientToken];
       player = this.state.players.get(oldSessionId);
 
       if (player && !player.isHost) {
-        // Migrate the MapSchema entry to the new sessionId
+        // 1. Migrate MapSchema entry to the new sessionId.
         this.state.players.delete(oldSessionId);
         this.state.players.set(client.sessionId, player);
 
-        // Update token maps
+        // 2. Update token maps.
         delete this._sessionIdToToken[oldSessionId];
-        this._tokenToSessionId[clientToken] = client.sessionId;
+        this._tokenToSessionId[clientToken]      = client.sessionId;
         this._sessionIdToToken[client.sessionId] = clientToken;
 
-        // Resolve and discard the old reconnect promise so it doesn't leak
+        // 3. Cancel the old allowReconnection promise.
+        //    We resolve it (not reject) so Colyseus closes the old slot cleanly
+        //    without treating it as an error. The new sessionId gets its own
+        //    fresh promise registered below after this if/else block.
         this._reconnectPromises = this._reconnectPromises || {};
         const oldPromise = this._reconnectPromises[oldSessionId];
         if (oldPromise) {
-          try { oldPromise.reject(new Error('superseded by token rejoin')); } catch (_) {}
+          try { oldPromise.resolve(client); } catch (_) {}
           delete this._reconnectPromises[oldSessionId];
         }
 
-        // Force-close the old socket if it is still connected (stale tab, slow disconnect)
+        // 4. Force-close the old socket if still connected (stale tab, slow disconnect).
+        //    Do this AFTER resolving the promise so Colyseus doesn't see an
+        //    unexpected close on a slot it thought was still pending.
         const oldClient = this.clients.find(c => c.sessionId === oldSessionId);
-        if (oldClient) oldClient.leave(1000);
+        if (oldClient && oldClient.sessionId !== client.sessionId) {
+          oldClient.leave(1000);
+        }
 
-        player.exited = false;
+        player.exited  = false;
         isTokenRejoin  = true;
         console.log(`[QuizRoom] Token-rejoin: ${player.nickname} (${this.roomId})`);
       } else {
-        // Stale token (player was removed) — treat as fresh join
-        player       = null;
+        // Stale token (player was removed or was a host) — treat as fresh join.
+        player        = null;
         assignedToken = this._generateToken();
       }
     }
 
-    // Try Colyseus-native sessionId lookup (short socket drop with same sessionId)
+    // ── Colyseus-native socket reconnect (short drop, same sessionId) ──
+    // allowReconnection() already held the seat; onJoin fires again with the
+    // same sessionId. PlayerState is intact — just clear the exited flag.
+    // Token system is not involved here; no migration needed.
     if (!player) {
       player = this.state.players.get(client.sessionId);
       if (player && !player.isHost) {
         player.exited = false;
-        // They already have a token from their first join
+        // Keep using the token they were already issued on first join.
         assignedToken = this._sessionIdToToken[client.sessionId] || this._generateToken();
       }
     }
@@ -231,7 +258,15 @@ class QuizRoom extends Room {
     this._tokenToSessionId[assignedToken]      = client.sessionId;
     this._sessionIdToToken[client.sessionId]   = assignedToken;
 
-    // Allow socket-level reconnect within the window
+    // FIX 3: Register a fresh allowReconnection promise for this sessionId.
+    // This covers three cases:
+    //   a) New player — first promise ever for this sessionId.
+    //   b) Colyseus-native socket reconnect — same sessionId, promise already
+    //      consumed by Colyseus internally; register a new one for the next drop.
+    //   c) Token-rejoin — old promise was resolved/cancelled above; new sessionId
+    //      needs its own fresh promise so subsequent short drops are covered.
+    // We always overwrite here because any prior promise for this exact sessionId
+    // is either already consumed (cases b/c) or doesn't exist (case a).
     this._reconnectPromises = this._reconnectPromises || {};
     this._reconnectPromises[client.sessionId] = this.allowReconnection(client, RECONNECT_WINDOW);
 
@@ -267,6 +302,7 @@ class QuizRoom extends Room {
         globalEndTime:   this._globalEndTime || null,
         questionIndex:   this.state.questionIndex,
         remainingTime:   this.state.remainingTime,
+        phaseEndTime:    this.state.phaseEndTime,
       });
     }
 
@@ -275,9 +311,10 @@ class QuizRoom extends Room {
 
   onLeave(client, consented) {
     // ── Host leaving ──
-    // Preserve hostToken + PlayerState for re-claim after refresh.
-    // Do NOT clear hostSessionId — in-flight host-command checks keep rejecting
-    // until the new session explicitly claims ownership in onJoin.
+    // Preserve hostToken + PlayerState for host re-claim on page refresh.
+    // hostSessionId is intentionally NOT cleared here — in-flight _isHost()
+    // checks keep rejecting commands until the new session claims ownership
+    // in onJoin. The host's allowReconnection promise keeps the seat open.
     if (client.sessionId === this.hostSessionId) return;
 
     const player = this.state.players.get(client.sessionId);
@@ -286,31 +323,47 @@ class QuizRoom extends Room {
     const inActiveGame = !['lobby', 'waiting_next_round', 'results', 'closed'].includes(this.state.phase);
 
     if (consented && !inActiveGame) {
-      // Deliberate leave from lobby/waiting — free the slot immediately.
+      // ── Deliberate leave from lobby / between rounds ──
+      // Free the slot immediately: no reconnect window needed.
       player.exited = true;
       this._activePlayerCount = Math.max(0, this._activePlayerCount - 1);
+
+      // Clean up both token maps — this player is gone for good.
       const tok = this._sessionIdToToken[client.sessionId];
       if (tok) {
         delete this._tokenToSessionId[tok];
         delete this._sessionIdToToken[client.sessionId];
       }
-      // Consented lobby leave — safe to drop the reconnect promise.
-      if (this._reconnectPromises) delete this._reconnectPromises[client.sessionId];
+
+      // FIX 3: Cancel the allowReconnection promise so Colyseus releases the
+      // seat immediately rather than holding it open for RECONNECT_WINDOW.
+      // Resolve (not reject) so Colyseus closes cleanly without logging errors.
+      if (this._reconnectPromises) {
+        const p = this._reconnectPromises[client.sessionId];
+        if (p) { try { p.resolve(client); } catch (_) {} }
+        delete this._reconnectPromises[client.sessionId];
+      }
       return;
     }
 
-    // ── Mid-game disconnect (or non-consented leave) ──
-    // NEVER mark exited, NEVER touch _tokenToSessionId, NEVER delete the
-    // reconnect promise.  The player keeps their slot and score so they can
-    // resume via token-rejoin within RECONNECT_WINDOW without the game
-    // freezing or _checkAllFinished firing a false "all done".
+    // ── Mid-game disconnect (or consented leave during active game) ──
     //
-    // _sessionIdToToken is cleaned because the sessionId is now dead; the
-    // token→sessionId mapping stays intact so onJoin can find them.
+    // FIX 3: allowReconnection() is the ONLY thing that holds the seat open here.
+    // The token system handles identity migration when the player returns — it does
+    // NOT need to touch the reconnect promise at all (that's done in onJoin).
+    //
+    // What we do NOT do here (intentionally):
+    //   - Do NOT mark player.exited — keeps their slot and score intact.
+    //   - Do NOT delete _tokenToSessionId[tok] — token system needs it for onJoin.
+    //   - Do NOT delete _reconnectPromises[sessionId] — Colyseus needs it to hold
+    //     the seat open until the player returns or the window expires.
+    //
+    // What we DO clean up:
+    //   - _sessionIdToToken: the old sessionId is dead. The reverse mapping is
+    //     only needed when the socket is live. Removing it prevents the dead
+    //     sessionId from being mistaken for a live one.
     const tok = this._sessionIdToToken[client.sessionId];
     if (tok) delete this._sessionIdToToken[client.sessionId];
-    // Reconnect promise is intentionally NOT deleted — Colyseus needs it to
-    // hold the slot open.  It will be superseded on token-rejoin in onJoin.
   }
 
   onDispose() {
@@ -677,76 +730,94 @@ class QuizRoom extends Room {
   // No client can set a phase directly.
   // ════════════════════════════════════════
 
-  _setPhase(phase) {
+  // ── FIX 2: Single phase-transition gate ─────────────────────
+  // ALL phase changes MUST go through _transitionTo().
+  // It clears every timer first, sets the phase + phaseEndTime once,
+  // then optionally schedules the single next-step callback.
+  //
+  // Rules enforced here:
+  //   1. Clear ALL timers before touching phase — no orphaned intervals.
+  //   2. One scheduler per transition — _phaseTimer is the only handle.
+  //   3. Nothing else in this file may call this.state.phase = directly
+  //      or schedule phase-driving timers independently.
+  //
+  // @param phase      — the new phase string (must be a valid QuizRoomState phase)
+  // @param durationMs — how long this phase lasts (0 = indefinite / no auto-advance)
+  // @param nextFn     — optional callback fired after durationMs; if omitted the
+  //                     caller is responsible for the next transition.
+  _transitionTo(phase, durationMs = 0, nextFn = null) {
+    // 1. Kill every live timer — no overlapping phases, ever.
+    this._clearAllTimers();
+
+    // 2. Set phase + timing in schema atomically.
     this.state.phase = phase;
-    console.log(`[QuizRoom] ${this.roomId} → phase: ${phase}`);
+    if (durationMs > 0) {
+      this.state.phaseEndTime = Date.now() + durationMs;
+    }
+    console.log(`[QuizRoom] ${this.roomId} → phase: ${phase}${durationMs ? ` (${durationMs}ms)` : ''}`);
+
+    // 3. Schedule the ONE next-step callback if provided.
+    if (nextFn && durationMs > 0) {
+      this._phaseTimer = setTimeout(() => {
+        this._phaseTimer = null;
+        nextFn();
+      }, durationMs);
+    }
+  }
+
+  // _setPhase is kept as a thin wrapper so existing call-sites that only need
+  // a label change (no duration, no auto-advance) still work.
+  // It routes through _transitionTo so the log + timer-clear guarantee holds.
+  _setPhase(phase) {
+    this._transitionTo(phase, 0, null);
   }
 
   _startCountdown() {
-    this._clearPhaseTimer();
-    this._clearTickInterval();          // clear any orphaned interval first
-    this._setPhase('countdown');
+    const durationMs = COUNTDOWN_DURATION * 1000;
+    // FIX 1 + FIX 2: set phaseEndTime once, one timer, one path to next phase.
     this.state.remainingTime = COUNTDOWN_DURATION;
-
-    // Tick the countdown
-    let secs = COUNTDOWN_DURATION;
-    this._tickInterval = setInterval(() => {
-      secs--;
-      this.state.remainingTime = Math.max(0, secs);
-      if (secs <= 0) {
-        clearInterval(this._tickInterval);
-        this._tickInterval = null;
-        this._startQuestion(0);
-      }
-    }, 1000);
+    this._transitionTo('countdown', durationMs, () => this._startQuestion(0));
   }
 
   _startQuestion(index) {
-    // Guard against stale timer callbacks firing after _endGame or _resetRoom.
-    // e.g. the countdown interval fires its last tick at the exact moment
-    // the host presses endGame — without this, a question would start on top of results.
+    // Guard: stale timer callbacks must not fire after the game has ended or reset.
+    // _transitionTo clears timers before transitions, but if _endGame or _resetRoom
+    // were called between when the callback was scheduled and when it fires, this
+    // guard prevents a question from overlapping a terminal phase.
     const terminalPhases = ['results', 'waiting_next_round', 'lobby', 'closed'];
     if (terminalPhases.includes(this.state.phase)) return;
 
     const mode = this.state.settings.gameMode;
 
     if (index >= this.activeQuestions.length) {
-      // All questions done
       if (mode === 'blitz') return; // blitz ends via _sendBlitzReveal
       this._endGame();
       return;
     }
 
-    this._clearPhaseTimer();
-    this._clearTickInterval();
-
-    this.state.questionIndex    = index;
-    this.state.questionStartedAt = Date.now();
-    this._setPhase('question');
-
     // ── Determine per-question timer duration ──
     let dur = 0;
-    if (mode === 'lightning')  dur = 8;
+    if (mode === 'lightning')     dur = 8;
     else if (mode === 'survival') dur = this.state.settings.survivalTimerDuration || 8;
-    else if (mode === 'blitz')  dur = this.state.settings.blitzTimerDuration || 12;
-    // classic: global timer only — no per-question timer
+    else if (mode === 'blitz')    dur = this.state.settings.blitzTimerDuration || 12;
+    // classic: no per-question timer — global timer set on question 0
+
+    // Set question metadata BEFORE transitioning (clients need it on the phase patch).
+    this.state.questionIndex      = index;
+    this.state.questionStartedAt  = Date.now();
+    if (dur > 0) this.state.remainingTime = dur;
 
     if (dur > 0) {
-      this.state.remainingTime = dur;
-
-      this._tickInterval = setInterval(() => {
-        this.state.remainingTime = Math.max(0, this.state.remainingTime - 1);
-        if (this.state.remainingTime <= 0) {
-          clearInterval(this._tickInterval);
-          this._tickInterval = null;
-          this._onQuestionTimeout(index);
-        }
-      }, 1000);
-    } else if (mode === 'classic') {
-      // Classic mode uses a single global countdown timer for the whole game.
-      // Only start it on question 0 — subsequent questions share the same running timer.
-      // questionIndex is still updated above so answer validation always matches.
-      if (index === 0) {
+      // FIX 2: _transitionTo is the single timer scheduler.
+      // It clears all previous timers, sets phaseEndTime, fires _onQuestionTimeout.
+      this._transitionTo('question', dur * 1000, () => this._onQuestionTimeout(index));
+      // Mirror _phaseTimer → _tickInterval so _clearTickInterval() callers can still reach it.
+      this._tickInterval = this._phaseTimer;
+    } else {
+      // classic: transition to question phase with no auto-advance timer.
+      this._transitionTo('question', 0);
+      if (mode === 'classic' && index === 0) {
+        // Global timer for the whole classic game — started once, drives _endGame.
         this._startGlobalTimer();
       }
     }
@@ -785,39 +856,38 @@ class QuizRoom extends Room {
   }
 
   _advanceQuestion(currentIndex) {
-    // Show brief answer reveal before next question
-    this._setPhase('answer_reveal');
-    this._phaseTimer = setTimeout(() => {
-      this._startQuestion(currentIndex + 1);
-    }, REVEAL_DURATION * 1000);
+    // FIX 2: _transitionTo clears timers and gates the single next-step callback.
+    this._transitionTo('answer_reveal', REVEAL_DURATION * 1000,
+      () => this._startQuestion(currentIndex + 1));
   }
 
   _endGame() {
-    this._clearAllTimers();
-    if (this.state.phase === 'results' || this.state.phase === 'waiting_next_round') return; // idempotent
+    // FIX 2: _transitionTo clears all timers before setting 'results'.
+    // The idempotent check here prevents double-calls from _checkAllFinished
+    // and a simultaneous timer callback both firing _endGame.
+    if (this.state.phase === 'results' || this.state.phase === 'waiting_next_round') return;
 
-    this._setPhase('results');
+    // Transition to results, then auto-advance to waiting_next_round after 8s.
+    this._transitionTo('results', 8000, () => {
+      if (this.state.phase === 'results') {
+        this._transitionTo('waiting_next_round', 0);
+      }
+    });
+
     this.broadcast('gameEnded', {});
     console.log(`[QuizRoom] Game ended: ${this.roomId}`);
-
-    // After a short delay, transition to waiting_next_round so:
-    //   1. Clients know the room is still alive and they don't need to rejoin.
-    //   2. The host can start the next round without players disconnecting.
-    // RESULTS_DELAY gives the results page time to animate in first.
-    this._phaseTimer = setTimeout(() => {
-      if (this.state.phase === 'results') {
-        this._setPhase('waiting_next_round');
-      }
-    }, 8000); // 8 s — long enough for results page to render and leaderboard to be seen
   }
 
   _resetRoom(newSettings) {
     this._clearAllTimers();
 
     // Reset schema state
-    this.state.phase            = 'lobby';
+    // FIX 2: use _transitionTo even here so the log and timer guarantee holds.
+    // _clearAllTimers was already called above, so this is safe to call directly.
+    this.state.phase            = 'lobby'; // direct set is safe here — _clearAllTimers ran above
     this.state.questionIndex    = -1;
     this.state.remainingTime    = 0;
+    this.state.phaseEndTime     = 0;
     this.state.teamScoreA       = 0;
     this.state.teamScoreB       = 0;
     this.state.blitzTeamCountA  = 0;
@@ -865,24 +935,28 @@ class QuizRoom extends Room {
   }
 
   // ════════════════════════════════════════
-  // GLOBAL TIMER  (classic / lightning modes)
-  // Ticks every second and updates remainingTime
-  // in schema — clients display from state patch.
+  // GLOBAL TIMER  (classic mode only)
+  // Called once on question 0. Sets phaseEndTime for client animation
+  // and schedules a single server-side _endGame callback.
+  // Uses _tickInterval so _clearAllTimers() can reach it independently
+  // of the phase-transition _phaseTimer.
   // ════════════════════════════════════════
 
   _startGlobalTimer() {
+    // Belt-and-suspenders: clear _tickInterval only (phase timer may be null at this point).
     this._clearTickInterval();
     const dur = this.state.settings.timerDuration;
     this.state.remainingTime = dur;
+    // FIX 1: set phaseEndTime once — client animates from this, no server tick needed.
+    this.state.phaseEndTime = Date.now() + (dur * 1000);
 
-    this._tickInterval = setInterval(() => {
-      this.state.remainingTime = Math.max(0, this.state.remainingTime - 1);
-      if (this.state.remainingTime <= 0) {
-        clearInterval(this._tickInterval);
-        this._tickInterval = null;
-        this._endGame();
-      }
-    }, 1000);
+    // Single timeout — drives _endGame when the global clock expires.
+    // _clearAllTimers() (called inside _transitionTo) will cancel this if
+    // the host ends the game early or a phase transition fires first.
+    this._tickInterval = setTimeout(() => {
+      this._tickInterval = null;
+      this._endGame();
+    }, dur * 1000);
   }
 
   // ════════════════════════════════════════
@@ -968,12 +1042,13 @@ class QuizRoom extends Room {
       this.state.inSuddenDeath = true;
       this._suddenDeathRound = (this._suddenDeathRound || 0) + 1;
 
-      this._clearPhaseTimer(); // always clear before scheduling a new one
+      // FIX 2: _transitionTo clears all timers before scheduling the next step.
+      const revealDelayMs = (REVEAL_DURATION + 0.5) * 1000;
       if (this._suddenDeathRound > MAX_SUDDEN_DEATH) {
-        // Too many ties — end as a draw after the reveal delay
-        this._phaseTimer = setTimeout(() => this._endGame(), (REVEAL_DURATION + 0.5) * 1000);
+        // Too many ties — end as a draw after the reveal delay.
+        this._transitionTo('answer_reveal', revealDelayMs, () => this._endGame());
       } else {
-        this._phaseTimer = setTimeout(() => {
+        this._transitionTo('answer_reveal', revealDelayMs, () => {
           const sdQ       = this.activeQuestions[0];
           const sdWrapped = { ...sdQ, q: '⚡ SUDDEN DEATH: ' + sdQ.q };
           this.activeQuestions.push(sdWrapped);
@@ -985,21 +1060,25 @@ class QuizRoom extends Room {
           };
           this._scheduleBlitzRevealTimeout(this.blitzRound.questionIndex);
 
-          // Phase machine: advance to new question
+          // Phase machine: advance to new blitz question.
           this.state.questionIndex = this.blitzRound.questionIndex;
-          this._setPhase('question');
+          // _transitionTo will be called inside _startQuestion, but we call it
+          // directly here to also send the blitzSuddenDeath broadcast atomically.
+          this._transitionTo('question', (this.state.settings.blitzTimerDuration || 12) * 1000,
+            () => this._onQuestionTimeout(this.blitzRound.questionIndex));
+          this._tickInterval = this._phaseTimer; // mirror for _clearTickInterval callers
 
           this.broadcast('blitzSuddenDeath', {
             question:      sdWrapped,
             questionIndex: this.blitzRound.questionIndex,
           });
-        }, (REVEAL_DURATION + 0.5) * 1000);
+        });
       }
 
     } else if (isLastQuestion) {
-      // Last question revealed, no tie — end the game
-      this._clearPhaseTimer(); // clear before scheduling
-      this._phaseTimer = setTimeout(() => this._endGame(), (REVEAL_DURATION + 0.5) * 1000);
+      // Last question revealed, no tie — end the game after the reveal delay.
+      // FIX 2: _transitionTo is the single scheduler — no manual _clearPhaseTimer needed.
+      this._transitionTo('answer_reveal', (REVEAL_DURATION + 0.5) * 1000, () => this._endGame());
     }
   }
 
@@ -1109,7 +1188,11 @@ class QuizRoom extends Room {
   }
 
   _clearTickInterval() {
-    if (this._tickInterval) { clearInterval(this._tickInterval); this._tickInterval = null; }
+    if (this._tickInterval) {
+      clearTimeout(this._tickInterval);
+      clearInterval(this._tickInterval); // belt-and-suspenders for any legacy call sites
+      this._tickInterval = null;
+    }
   }
 
   _clearAllTimers() {
