@@ -93,8 +93,10 @@ class QuizRoomState extends Schema {
     // ── Round / Question Tracking ──
     this.roundNumber      = 0;
     this.questionIndex    = -1;   // -1 = not started
-    this.remainingTime    = 0;    // seconds, ticks server-side
+    this.remainingTime    = 0;    // seconds — set once at phase start, NOT ticked every second
     this.questionStartedAt = 0;   // ms timestamp
+    // FIX 1: server calculates end time once; clients animate locally from this
+    this.phaseEndTime     = 0;    // ms epoch — client: remaining = phaseEndTime - Date.now()
 
     // ── Team Scores (blitz) ──
     this.teamScoreA       = 0;
@@ -118,6 +120,7 @@ defineTypes(QuizRoomState, {
   questionIndex:    'number',
   remainingTime:    'number',
   questionStartedAt:'number',
+  phaseEndTime:     'number',
   teamScoreA:       'number',
   teamScoreB:       'number',
   blitzTeamCountA:  'number',
