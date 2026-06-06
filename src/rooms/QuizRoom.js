@@ -536,7 +536,11 @@ class QuizRoom extends Room {
         player.correctCount++;
         let points = 1;
         if (mode === 'lightning') {
-          points = timeSpent <= 5 ? 3 : timeSpent <= 10 ? 2 : 1;
+          // Scale bonus brackets proportionally to the chosen per-question timer.
+          // First third of time = 3×, middle third = 2×, last third = 1×.
+          const dur = this.state.settings.lightningQDuration || 5;
+          const third = dur / 3;
+          points = timeSpent <= third ? 3 : timeSpent <= third * 2 ? 2 : 1;
         } else if (scoring === 'speed') {
           points = timeSpent <= 3 ? 3 : timeSpent <= 8 ? 2 : 1;
         }
@@ -798,7 +802,7 @@ class QuizRoom extends Room {
 
     // ── Determine per-question timer duration ──
     let dur = 0;
-    if (mode === 'lightning')     dur = 8;
+    if (mode === 'lightning')     dur = this.state.settings.lightningQDuration || 5;
     else if (mode === 'survival') dur = this.state.settings.survivalTimerDuration || 8;
     else if (mode === 'blitz')    dur = this.state.settings.blitzTimerDuration || 12;
     // classic: no per-question timer — global timer set on question 0
@@ -1231,6 +1235,7 @@ class QuizRoom extends Room {
     if (s.questionCount        !== undefined) st.questionCount        = s.questionCount;
     if (s.timerDuration        !== undefined) st.timerDuration        = s.timerDuration;
     if (s.blitzTimerDuration   !== undefined) st.blitzTimerDuration   = s.blitzTimerDuration;
+    if (s.lightningQDuration   !== undefined) st.lightningQDuration   = s.lightningQDuration;
     if (s.survivalTimerDuration!== undefined) st.survivalTimerDuration= s.survivalTimerDuration;
     if (s.teamAName            !== undefined) st.teamAName            = s.teamAName;
     if (s.teamBName            !== undefined) st.teamBName            = s.teamBName;
@@ -1244,6 +1249,7 @@ class QuizRoom extends Room {
       questionCount:         s.questionCount,
       timerDuration:         s.timerDuration,
       blitzTimerDuration:    s.blitzTimerDuration,
+      lightningQDuration:    s.lightningQDuration,
       survivalTimerDuration: s.survivalTimerDuration,
       teamAName:             s.teamAName,
       teamBName:             s.teamBName,
