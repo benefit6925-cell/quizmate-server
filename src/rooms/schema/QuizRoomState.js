@@ -60,6 +60,7 @@ class GameSettingsState extends Schema {
     this.questionCount        = 20;
     this.timerDuration        = 120;
     this.blitzTimerDuration   = 12;
+    this.lightningQDuration   = 5;
     this.survivalTimerDuration = 8;
     this.teamAName            = 'Team A';
     this.teamBName            = 'Team B';
@@ -71,6 +72,7 @@ defineTypes(GameSettingsState, {
   questionCount:        'number',
   timerDuration:        'number',
   blitzTimerDuration:   'number',
+  lightningQDuration:   'number',
   survivalTimerDuration:'number',
   teamAName:            'string',
   teamBName:            'string',
