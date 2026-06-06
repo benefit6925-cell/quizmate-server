@@ -301,6 +301,10 @@ class QuizRoom extends Room {
         startTime:       this.state.questionStartedAt,
         globalEndTime:   this._globalEndTime || null,
         questionIndex:   this.state.questionIndex,
+        // Survival tracks per-player progress independently of the server's
+        // timeout-chain index. Send the player's own next question so the
+        // client resumes at the right place, not the server's cursor.
+        playerQuestionIndex: player.answeredIndex + 1,
         remainingTime:   this.state.remainingTime,
         phaseEndTime:    this.state.phaseEndTime,
       });
@@ -841,7 +845,21 @@ class QuizRoom extends Room {
           player.finishedAt = Date.now();
         }
       });
+
+      // Check if the game is over before arming the next question's timer.
+      // _checkAllFinished calls _endGame() if everyone is done/eliminated.
+      // We inspect phase AFTER the call to decide whether to continue.
       this._checkAllFinished();
+
+      // FIX — Survival per-question timer:
+      // Survival is client-driven (players self-advance questions), but the server
+      // must arm a timeout for EACH question so slow/disconnected players are
+      // eliminated correctly.  Without this the timer only fires once (question 0).
+      // Only advance if the game is still running (not ended by _checkAllFinished above).
+      const terminalPhases = ['results', 'waiting_next_round', 'lobby', 'closed'];
+      if (!terminalPhases.includes(this.state.phase)) {
+        this._startQuestion(index + 1);
+      }
       return;
     }
 
