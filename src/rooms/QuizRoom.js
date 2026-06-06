@@ -608,8 +608,9 @@ class QuizRoom extends Room {
 
       const qi = data.questionIndex;
 
-      // For blitz, we don't use state.questionIndex as authority — the client drives
-      // question advancement from showBlitzReveal. Instead validate against blitzRound.
+      // Validate against blitzRound, not state.questionIndex — the server pre-sets
+      // blitzRound.questionIndex before transitioning to the next question phase,
+      // so answers submitted right as the phase changes are correctly routed.
       // Reject only if the blitz round for this qi was already revealed (stale answer).
       if (this.blitzRound && this.blitzRound.questionIndex === qi && this.blitzRound.revealSent) return;
       // Also reject if qi is for an already-revealed past question
@@ -849,7 +850,18 @@ class QuizRoom extends Room {
     }
 
     if (mode === 'lightning') {
-      // Auto-advance to next question for lightning mode
+      // Broadcast the correct answer to ALL players before advancing.
+      // In lightning mode players don't self-submit on timeout — the server
+      // must tell everyone the correct answer so they can display it during
+      // the answer_reveal phase. Without this, clients that didn't answer
+      // have no correct-answer data and may mis-render the reveal screen.
+      const q = this.activeQuestions[index];
+      if (q) {
+        this.broadcast('questionReveal', {
+          questionIndex: index,
+          correctAnswer: q.answer,
+        });
+      }
       this._advanceQuestion(index);
     }
     // classic: global timer handles end-of-game
@@ -1079,6 +1091,38 @@ class QuizRoom extends Room {
       // Last question revealed, no tie — end the game after the reveal delay.
       // FIX 2: _transitionTo is the single scheduler — no manual _clearPhaseTimer needed.
       this._transitionTo('answer_reveal', (REVEAL_DURATION + 0.5) * 1000, () => this._endGame());
+
+    } else {
+      // ── BUG 3 FIX: Mid-game blitz question — server drives next question ──
+      // Fix 4c removed the client's countdown-driven question advancement.
+      // The server must now schedule the transition to the next blitz question.
+      // We go: answer_reveal (4s) → question (blitzTimer) → _sendBlitzReveal again.
+      const nextIndex = questionIndex + 1;
+      const blitzDur  = (this.state.settings.blitzTimerDuration || 12) * 1000;
+      const revealMs  = (REVEAL_DURATION + 0.5) * 1000;
+
+      this._transitionTo('answer_reveal', revealMs, () => {
+        // Set up the blitzRound tracker for the next question BEFORE transitioning,
+        // so blitzAnswer submissions for the new question are accepted immediately.
+        this.blitzRound = {
+          questionIndex: nextIndex,
+          answers:       {},
+          revealSent:    false,
+        };
+        this.state.questionIndex = nextIndex;
+
+        // Transition to the next question phase.
+        // _transitionTo's callback fires _sendBlitzReveal when the timer expires
+        // (all players didn't answer in time). If all players answer before the
+        // timer, blitzAnswer handler calls _sendBlitzReveal early — the revealSent
+        // guard makes the _transitionTo callback a safe no-op in that case.
+        this._transitionTo('question', blitzDur, () => {
+          if (this.blitzRound && !this.blitzRound.revealSent) {
+            this._sendBlitzReveal(nextIndex);
+          }
+        });
+        this._tickInterval = this._phaseTimer; // mirror for _clearAllTimers
+      });
     }
   }
 
@@ -1131,10 +1175,47 @@ class QuizRoom extends Room {
     if (this.state.phase === 'results' || this.state.phase === 'waiting_next_round') return;
     if (this._activePlayerCount <= 0) return;
 
-    let doneCount = 0;
+    const mode = this.state.settings.gameMode;
+
+    let doneCount  = 0;
+    let aliveCount = 0;
+    let lastAlive  = null;
     this.state.players.forEach((p) => {
-      if (!p.isHost && !p.exited && (p.finished || p.eliminated)) doneCount++;
+      if (p.isHost || p.exited) return;
+      if (p.finished || p.eliminated) {
+        doneCount++;
+      } else {
+        aliveCount++;
+        lastAlive = p;
+      }
     });
+
+    // ── Survival: last-man-standing rule ──
+    // When exactly one player remains alive, they win the moment they answer
+    // their next question — regardless of correct/wrong — even if more
+    // questions remain. We detect this here: if aliveCount === 1 and that
+    // player has answered at least one question past the eliminated group,
+    // end the game immediately and crown them winner.
+    if (mode === 'survival' && aliveCount === 1 && lastAlive) {
+      // Find the highest answeredIndex among all eliminated players to know
+      // when the last man has "answered one more than everyone else".
+      let maxElimAnswered = -1;
+      this.state.players.forEach((p) => {
+        if (p.isHost || p.exited) return;
+        if (p.eliminated) maxElimAnswered = Math.max(maxElimAnswered, p.answeredIndex);
+      });
+      // The moment the last alive player's answeredIndex exceeds the highest
+      // eliminated player's answeredIndex, they have answered "one more" — game over.
+      if (lastAlive.answeredIndex > maxElimAnswered) {
+        lastAlive.finished  = true;
+        lastAlive.finishedAt = Date.now();
+        this.broadcast('allFinished', {});
+        this._endGame();
+        return;
+      }
+      // Last man hasn't answered their "winning" question yet — wait.
+      return;
+    }
 
     if (doneCount >= this._activePlayerCount) {
       this.broadcast('allFinished', {});
