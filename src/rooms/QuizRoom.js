@@ -470,6 +470,16 @@ class QuizRoom extends Room {
 
       // Kick off phase machine
       this._recalcActiveCount(); // sync active count before gameplay begins
+      // Initialize blitzRound for the first question before countdown fires.
+      // This must happen before _startCountdown so the first blitzAnswer from any
+      // player is accepted the moment the question phase begins.
+      if (this.state.settings.gameMode === 'blitz') {
+        this.blitzRound = {
+          questionIndex: 0,
+          answers:       {},
+          revealSent:    false,
+        };
+      }
       this._startCountdown();
     });
 
@@ -604,6 +614,19 @@ class QuizRoom extends Room {
       if (player && !player.exited) {
         player.exited = true;
         this._activePlayerCount = Math.max(0, this._activePlayerCount - 1);
+        // Clean up token maps so this player cannot ghost-rejoin in a future round.
+        // Mirror the deliberate-exit path in onLeave().
+        const tok = this._sessionIdToToken[client.sessionId];
+        if (tok) {
+          delete this._tokenToSessionId[tok];
+          delete this._sessionIdToToken[client.sessionId];
+        }
+        // Release the reconnect seat immediately.
+        if (this._reconnectPromises) {
+          const p = this._reconnectPromises[client.sessionId];
+          if (p) { try { p.resolve(client); } catch (_) {} }
+          delete this._reconnectPromises[client.sessionId];
+        }
       }
     });
 
@@ -616,23 +639,21 @@ class QuizRoom extends Room {
 
       const qi = data.questionIndex;
 
+      // If blitzRound is null, the game hasn't started yet or was just reset.
+      // Reject any stale in-flight answers from the previous round rather than
+      // creating a new blitzRound object that would corrupt the fresh game state.
+      if (!this.blitzRound) return;
+
       // Validate against blitzRound, not state.questionIndex — the server pre-sets
       // blitzRound.questionIndex before transitioning to the next question phase,
       // so answers submitted right as the phase changes are correctly routed.
       // Reject only if the blitz round for this qi was already revealed (stale answer).
-      if (this.blitzRound && this.blitzRound.questionIndex === qi && this.blitzRound.revealSent) return;
+      if (this.blitzRound.questionIndex === qi && this.blitzRound.revealSent) return;
       // Also reject if qi is for an already-revealed past question
-      if (this.blitzRound && this.blitzRound.questionIndex > qi) return;
+      if (this.blitzRound.questionIndex > qi) return;
 
-      if (!this.blitzRound || this.blitzRound.questionIndex !== qi) {
-        this.blitzRound = {
-          questionIndex: qi,
-          answers:      {},
-          revealSent:   false,
-        };
-        // Start server-side reveal timeout for this question
-        this._scheduleBlitzRevealTimeout(qi);
-      }
+      // Reject if qi is for a future question (shouldn't happen — server drives question index)
+      if (this.blitzRound.questionIndex !== qi) return;
 
       // Reject if reveal already sent for this round
       if (this.blitzRound.revealSent) return;
@@ -932,8 +953,17 @@ class QuizRoom extends Room {
     // Reset all player schema fields
     const keepTeams = (newSettings && newSettings.gameMode === 'blitz') ||
                       (!newSettings && this.state.settings.gameMode === 'blitz');
-    this.state.players.forEach((player) => {
+    const toDelete = [];
+    this.state.players.forEach((player, playerId) => {
       if (player.isHost) return;
+      // If this player's token was deleted (deliberate exit from lobby), remove their slot
+      // entirely rather than resurrecting them with exited=false.
+      // A deliberately exited player has no entry in _tokenToSessionId.
+      const tok = this._sessionIdToToken[playerId];
+      if (player.exited && !tok && !this._tokenToSessionId[Object.keys(this._tokenToSessionId).find(t => this._tokenToSessionId[t] === playerId)]) {
+        toDelete.push(playerId);
+        return;
+      }
       player.score             = 0;
       player.correctCount      = 0;
       player.finished          = false;
@@ -945,6 +975,7 @@ class QuizRoom extends Room {
       if (!keepTeams) player.team = '';
       player.answeredIndex     = -1;
     });
+    toDelete.forEach(id => this.state.players.delete(id));
 
     this.activeQuestions = [];
     this.blitzRound      = null;
@@ -953,7 +984,8 @@ class QuizRoom extends Room {
 
     if (newSettings) this._applySettings(newSettings);
 
-    // Re-sync team counts from actual player.team values
+    // Re-sync team counts and active count from actual player values (post-reset ground truth)
+    this._recalcActiveCount();
     if (this.state.settings.gameMode === 'blitz') {
       this._recalcBlitzTeamCounts();
     }
