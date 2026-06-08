@@ -1012,9 +1012,19 @@ class QuizRoom extends Room {
 
     // Send round reset — clients get schema patch for phase + player resets automatically.
     // This message is kept for one-time UI actions (toast, page transition).
-    this.broadcast('roundReset', {
-      settings: this._getSettingsPlain(),
-      players:  this._getPlayersPlain(),
+    // For blitz mode, send each player their server-authoritative assignedTeam so the
+    // client blitzState.myTeam stays in sync after non-blitz rounds cleared player.team.
+    const isBlitzReset = this.state.settings.gameMode === 'blitz';
+    const settingsPlain = this._getSettingsPlain();
+    const playersPlain  = this._getPlayersPlain();
+    this.clients.forEach(c => {
+      const p = this.state.players.get(c.sessionId);
+      const assignedTeam = (isBlitzReset && p && !p.isHost) ? (p.team || null) : undefined;
+      c.send('roundReset', {
+        settings: settingsPlain,
+        players:  playersPlain,
+        ...(assignedTeam !== undefined ? { assignedTeam } : {}),
+      });
     });
 
     console.log(`[QuizRoom] Reset: ${this.roomId}`);
