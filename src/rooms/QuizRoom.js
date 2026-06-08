@@ -661,12 +661,32 @@ class QuizRoom extends Room {
       // One answer per player per question
       if (this.blitzRound.answers[client.sessionId]) return;
 
+      const q = this.activeQuestions[qi];
+      const isCorrect = q && data.answer === q.answer;
+
+      // ── FIX: Increment blitzCorrectCount on server immediately ──
+      // This is the authoritative count — client sends blitzFinished but
+      // the server had no handler for it, leaving blitzCorrectCount at 0.
+      if (isCorrect) {
+        player.blitzCorrectCount = (player.blitzCorrectCount || 0) + 1;
+      }
+
       this.blitzRound.answers[client.sessionId] = {
         sessionId: client.sessionId,
         team:      player.team || 'A',   // server-authoritative — never trust data.team
         answer:    data.answer,
         timestamp: Date.now(),           // server clock — never trust data.timestamp
       };
+
+      // ── Broadcast teammate pick letter to same-team players ──
+      const senderTeam = player.team || 'A';
+      this.clients.forEach(c => {
+        if (c.sessionId === client.sessionId) return;
+        const teammate = this.state.players.get(c.sessionId);
+        if (teammate && teammate.team === senderTeam) {
+          c.send('blitzTeammatePicked', { answer: data.answer, questionIndex: qi });
+        }
+      });
 
       // Check if all active players have answered.
       // Uses _activePlayerCount (O(1)) instead of scanning the full players map.
