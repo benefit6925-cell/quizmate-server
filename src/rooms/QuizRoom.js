@@ -954,6 +954,10 @@ class QuizRoom extends Room {
   }
 
   _resetRoom(newSettings) {
+    const _prevPhase = this.state.phase;
+    const _prevMode  = this.state.settings && this.state.settings.gameMode;
+    const _newMode   = (newSettings && newSettings.gameMode) || _prevMode;
+    console.log(`[RESET] called | prevPhase=${_prevPhase} | prevMode=${_prevMode} | newMode=${_newMode} | clients=${this.clients.length}`);
     this._clearAllTimers();
 
     // Reset schema state
@@ -1010,24 +1014,29 @@ class QuizRoom extends Room {
       this._recalcBlitzTeamCounts();
     }
 
-    // Send round reset — clients get schema patch for phase + player resets automatically.
-    // This message is kept for one-time UI actions (toast, page transition).
-    // For blitz mode, send each player their server-authoritative assignedTeam so the
-    // client blitzState.myTeam stays in sync after non-blitz rounds cleared player.team.
-    const isBlitzReset = this.state.settings.gameMode === 'blitz';
-    const settingsPlain = this._getSettingsPlain();
-    const playersPlain  = this._getPlayersPlain();
-    this.clients.forEach(c => {
-      const p = this.state.players.get(c.sessionId);
-      const assignedTeam = (isBlitzReset && p && !p.isHost) ? (p.team || null) : undefined;
-      c.send('roundReset', {
-        settings: settingsPlain,
-        players:  playersPlain,
-        ...(assignedTeam !== undefined ? { assignedTeam } : {}),
-      });
-    });
+    // broadcast() is the reliable path — handles disconnected/closing sockets gracefully.
+    // forEach c.send() can silently drop messages for clients in a closing state,
+    // which would leave players stuck on the results screen forever.
+    const _broadcastPayload = { settings: this._getSettingsPlain(), players: this._getPlayersPlain() };
+    console.log(`[RESET] broadcasting roundReset | mode=${this.state.settings.gameMode} | playerCount=${Object.keys(_broadcastPayload.players).length}`);
+    this.broadcast('roundReset', _broadcastPayload);
 
-    console.log(`[QuizRoom] Reset: ${this.roomId}`);
+    // For blitz: send each player their server-authoritative team assignment.
+    // Sent AFTER roundReset so the client has already reset blitzState before this arrives.
+    // Wrapped in try/catch per-client so one bad socket never blocks the rest.
+    if (this.state.settings.gameMode === 'blitz') {
+      this.clients.forEach(c => {
+        const p = this.state.players.get(c.sessionId);
+        if (!p || p.isHost) return;
+        const team = p.team || null;
+        console.log(`[RESET] blitzTeamAssign | session=${c.sessionId} | team=${team}`);
+        try { c.send('blitzTeamAssign', { team }); } catch (e) {
+          console.log(`[RESET] blitzTeamAssign FAILED | session=${c.sessionId} | err=${e.message}`);
+        }
+      });
+    }
+
+    console.log(`[RESET] complete | roomId=${this.roomId}`);
   }
 
   // ════════════════════════════════════════
