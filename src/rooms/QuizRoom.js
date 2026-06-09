@@ -129,7 +129,11 @@ class QuizRoom extends Room {
       }
 
       this._reconnectPromises = this._reconnectPromises || {};
-      this._reconnectPromises[client.sessionId] = this.allowReconnection(client, RECONNECT_WINDOW);
+      try {
+        this._reconnectPromises[client.sessionId] = this.allowReconnection(client, RECONNECT_WINDOW);
+      } catch (_) {
+        delete this._reconnectPromises[client.sessionId];
+      }
 
       client.send('joinAck', {
         status:    this.state.phase,
@@ -263,8 +267,20 @@ class QuizRoom extends Room {
     //      needs its own fresh promise so subsequent short drops are covered.
     // We always overwrite here because any prior promise for this exact sessionId
     // is either already consumed (cases b/c) or doesn't exist (case a).
+    // allowReconnection() throws "not joined" when called on a freshly connected
+    // client — this is a Colyseus quirk where the client must be in a "leaving"
+    // state for the call to succeed. On a brand-new connection the promise won't
+    // be registered, but that's fine — onLeave will simply not find it and the
+    // default Colyseus behaviour applies. On a genuine reconnect (token-rejoin)
+    // the client IS in a leaving state so it works correctly.
     this._reconnectPromises = this._reconnectPromises || {};
-    this._reconnectPromises[client.sessionId] = this.allowReconnection(client, RECONNECT_WINDOW);
+    try {
+      this._reconnectPromises[client.sessionId] = this.allowReconnection(client, RECONNECT_WINDOW);
+    } catch (_) {
+      // Fresh connection — allowReconnection not applicable yet. The promise
+      // will be registered on their next onLeave/onJoin cycle.
+      delete this._reconnectPromises[client.sessionId];
+    }
 
     // ── Send acknowledgement ──
     const ackBase = {
@@ -384,6 +400,11 @@ class QuizRoom extends Room {
     // ── Keepalive: client pings every 25s to keep the WebSocket alive on Render ──
     // No-op on the server — just receiving it is enough to reset the idle timer.
     this.onMessage('keepalive', () => {});
+
+    // ── blitzFinished: sent by client when blitz results are shown ──
+    // Server has no action to take — this was a legacy client message.
+    // Registered here to prevent "onMessage not registered" log noise.
+    this.onMessage('blitzFinished', () => {});
 
     // ── HOST: Start game ──
     this.onMessage('startGame', (client, data) => {
