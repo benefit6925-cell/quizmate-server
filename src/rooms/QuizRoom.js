@@ -71,7 +71,6 @@ class QuizRoom extends Room {
     if (options.settings) this._applySettings(options.settings);
 
     this._registerHandlers();
-    console.log(`[QuizRoom] Created: ${this.roomId}`);
   }
 
   onJoin(client, options) {
@@ -103,7 +102,6 @@ class QuizRoom extends Room {
         this.hostSessionId = client.sessionId;
       } else if (clientHostTok && clientHostTok === this.hostToken) {
         // Host refreshed the page — re-grant ownership to new sessionId
-        console.log(`[QuizRoom] Host re-claimed ownership: ${this.roomId}`);
         this.hostSessionId = client.sessionId;
       } else if (!this.hostSessionId) {
         // Host token exists but sessionId is gone (host crashed) — allow re-claim
@@ -141,7 +139,6 @@ class QuizRoom extends Room {
         hostToken: this.hostToken,   // client must persist this in sessionStorage
       });
 
-      console.log(`[QuizRoom] Host joined: ${this.roomId}`);
       return;
     }
 
@@ -205,7 +202,6 @@ class QuizRoom extends Room {
 
         player.exited  = false;
         isTokenRejoin  = true;
-        console.log(`[QuizRoom] Token-rejoin: ${player.nickname} (${this.roomId})`);
       } else {
         // Stale token (player was removed or was a host) — treat as fresh join.
         player        = null;
@@ -310,7 +306,6 @@ class QuizRoom extends Room {
       });
     }
 
-    console.log(`[QuizRoom] ${nick} joined ${this.roomId} (tokenRejoin=${isTokenRejoin})`);
   }
 
   onLeave(client, consented) {
@@ -376,7 +371,6 @@ class QuizRoom extends Room {
     this._tokenToSessionId  = {};
     this._sessionIdToToken  = {};
     this._reconnectPromises = {};
-    console.log(`[QuizRoom] Disposed: ${this.roomId}`);
   }
 
   // ════════════════════════════════════════
@@ -386,6 +380,10 @@ class QuizRoom extends Room {
   // ════════════════════════════════════════
 
   _registerHandlers() {
+
+    // ── Keepalive: client pings every 25s to keep the WebSocket alive on Render ──
+    // No-op on the server — just receiving it is enough to reset the idle timer.
+    this.onMessage('keepalive', () => {});
 
     // ── HOST: Start game ──
     this.onMessage('startGame', (client, data) => {
@@ -804,7 +802,6 @@ class QuizRoom extends Room {
     if (durationMs > 0) {
       this.state.phaseEndTime = Date.now() + durationMs;
     }
-    console.log(`[QuizRoom] ${this.roomId} → phase: ${phase}${durationMs ? ` (${durationMs}ms)` : ''}`);
 
     // 3. Schedule the ONE next-step callback if provided.
     if (nextFn && durationMs > 0) {
@@ -950,14 +947,12 @@ class QuizRoom extends Room {
     });
 
     this.broadcast('gameEnded', {});
-    console.log(`[QuizRoom] Game ended: ${this.roomId}`);
   }
 
   _resetRoom(newSettings) {
     const _prevPhase = this.state.phase;
     const _prevMode  = this.state.settings && this.state.settings.gameMode;
     const _newMode   = (newSettings && newSettings.gameMode) || _prevMode;
-    console.log(`[RESET] called | prevPhase=${_prevPhase} | prevMode=${_prevMode} | newMode=${_newMode} | clients=${this.clients.length}`);
     this._clearAllTimers();
 
     // Reset schema state
@@ -1018,7 +1013,6 @@ class QuizRoom extends Room {
     // forEach c.send() can silently drop messages for clients in a closing state,
     // which would leave players stuck on the results screen forever.
     const _broadcastPayload = { settings: this._getSettingsPlain(), players: this._getPlayersPlain() };
-    console.log(`[RESET] broadcasting roundReset | mode=${this.state.settings.gameMode} | playerCount=${Object.keys(_broadcastPayload.players).length}`);
     this.broadcast('roundReset', _broadcastPayload);
 
     // For blitz: send each player their server-authoritative team assignment.
@@ -1029,14 +1023,11 @@ class QuizRoom extends Room {
         const p = this.state.players.get(c.sessionId);
         if (!p || p.isHost) return;
         const team = p.team || null;
-        console.log(`[RESET] blitzTeamAssign | session=${c.sessionId} | team=${team}`);
         try { c.send('blitzTeamAssign', { team }); } catch (e) {
-          console.log(`[RESET] blitzTeamAssign FAILED | session=${c.sessionId} | err=${e.message}`);
         }
       });
     }
 
-    console.log(`[RESET] complete | roomId=${this.roomId}`);
   }
 
   // ════════════════════════════════════════
